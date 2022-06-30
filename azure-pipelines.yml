@@ -1,0 +1,301 @@
+name: Docker Manager
+
+parameters:
+- name: image
+  displayName: Pool Image
+  type: string
+  default: ubuntu-latest
+  values:
+  - windows-latest
+  - ubuntu-latest
+- name: releasePlex
+  default: true # value passed to the condition below
+  type: boolean
+
+variables:
+  - group: secureVariables
+  - name: artifactName 
+    value: 'artefacts'
+  - name: System.Debug 
+    value: 'true'
+  - name: dockerNetwork 
+    value: 'homemedia_net'
+  - name: containerConfigRootPathNFS
+    value: /home/filer/containerconfigs
+  - name: containerConfigRootPathLocal
+    value: /home/filer/containerconfigs-local
+  - name: sandpitDockerHostIP 
+    value: '192.168.0.200'
+  - name: masterDockerHostIP 
+    value: '192.168.0.201'
+  - name: timeZone 
+    value: Europe/London
+  - name: restartValue 
+    value: unless-stopped
+
+resources:
+  repositories:
+  - repository: self
+    trigger: 
+      branches:
+        include:
+        - master
+
+stages:
+#########################################################################################################################
+#########################################################################################################################
+####################################################### BUILD ###########################################################
+  - stage: buildArtefacts
+    displayName: Build (CI)
+    jobs:
+      - job: 'Build'
+        pool:
+          vmimage: ${{parameters.image}}
+
+        steps:
+
+        - task: CopyFiles@2
+          displayName: Copy files
+          inputs:
+            SourceFolder: '$(Build.SourcesDirectory)'
+            Contents: '**'
+            TargetFolder: '$(Build.ArtifactStagingDirectory)'
+       
+        - task: replacetokens@3
+          displayName:  Replace Tokens YML
+          inputs:
+            rootDirectory: '$(Build.ArtifactStagingDirectory)'
+            targetFiles: '**/*.yml'
+            encoding: 'auto'
+            writeBOM: true
+            actionOnMissing: 'warn'
+            keepToken: false
+            tokenPrefix: '__'
+            tokenSuffix: '__'
+            useLegacyPattern: false
+            enableTelemetry: true
+
+        - task: replacetokens@3
+          displayName:  Replace Tokens CONF
+          inputs:
+            rootDirectory: '$(Build.ArtifactStagingDirectory)'
+            targetFiles: '**/*.conf'
+            encoding: 'auto'
+            writeBOM: true
+            actionOnMissing: 'warn'
+            keepToken: false
+            tokenPrefix: '__'
+            tokenSuffix: '__'
+            useLegacyPattern: false
+            enableTelemetry: true
+  
+        - task: PublishBuildArtifacts@1
+          displayName:  Publish build artifacts
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+            ArtifactName: '$(artifactName)'
+
+        - task: CmdLine@2
+          displayName: Notify Pushover
+          inputs:
+            script: |
+              curl -s \
+                --form-string "token=$(pushoverToken)" \
+                --form-string "user=$(pushoverKey)" \
+                --form-string "message=BUILD Stage Complete: PLEX Deployment ${{parameters.releasePlex}}" \
+                --form-string "priority=-1" \
+                https://api.pushover.net/1/messages.json
+
+#########################################################################################################################
+#########################################################################################################################
+################################################## FILE COPIES ##########################################################
+  - stage: CopyConfigs
+    displayName: copyConfigs (CD)
+    dependsOn: 
+      - buildArtefacts
+    condition: succeeded('buildArtefacts')
+    jobs:
+    - deployment: copyConfigFiles
+      displayName: Copy Container Config Files
+
+      environment:
+        name: Docker
+        resourceName: docker-master
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+
+            - task: CopyFiles@2
+              displayName: Copy nginx Config File
+              inputs:
+                SourceFolder: $(Pipeline.Workspace)/$(artifactName)/filer/containerConfigs/nginx/
+                OverWrite: true
+                Contents: nginx.conf
+                TargetFolder: $(containerConfigRootPathNFS)/nginx/
+
+            - task: CopyFiles@2
+              displayName: Copy pihole Config File
+              inputs:
+                SourceFolder: $(Pipeline.Workspace)/$(artifactName)/filer/containerConfigs/pihole/
+                OverWrite: true
+                Contents: custom.list
+                TargetFolder: $(containerConfigRootPathNFS)/dns/etc/
+
+            - task: CopyFiles@2
+              displayName: Copy influx Config File
+              inputs:
+                SourceFolder: $(Pipeline.Workspace)/$(artifactName)/filer/containerConfigs/influx/
+                OverWrite: true
+                Contents: influxdb.conf
+                TargetFolder: $(containerConfigRootPathNFS)/influx/config/
+
+            - task: CopyFiles@2
+              displayName: Copy ddclient Config
+              inputs:
+                SourceFolder: $(Pipeline.Workspace)/$(artifactName)/filer/containerConfigs/ddclient/
+                OverWrite: true
+                Contents: ddclient.conf
+                TargetFolder: $(containerConfigRootPathNFS)/ddclient/
+
+            - task: CopyFiles@2
+              displayName: Copy ddclient Config
+              inputs:
+                SourceFolder: $(Pipeline.Workspace)/$(artifactName)/filer/containerConfigs/ddclient-duck/
+                OverWrite: true
+                Contents: ddclient.conf
+                TargetFolder: $(containerConfigRootPathNFS)/ddclient-duck/
+  
+            - task: CopyFiles@2
+              displayName: Copy scripts
+              inputs:
+                SourceFolder: $(Pipeline.Workspace)/$(artifactName)/scripts/
+                OverWrite: true
+                Contents: '**'
+                TargetFolder: /home/filer/scripts/
+
+#########################################################################################################################
+#########################################################################################################################
+###################################################### FILER ###########################################################
+  - stage: deployDockerLiveEnvironment_filer
+    displayName: FILER Deploy (CD)
+    dependsOn: 
+      - CopyConfigs
+    condition: succeeded('CopyConfigs')
+    jobs:
+    - deployment: deployDockerResourcesFiler
+      displayName: Deploy Docker Resources to FILER Host
+
+      # creates an environment if it doesn't exist
+      environment:
+        name: Docker
+        resourceName: docker-master
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+
+            - task: Bash@3
+              displayName: Docker Network Create 
+              inputs:
+                targetType: 'inline'
+                script: 'docker network create -d bridge $(dockerNetwork) || true'
+
+            - task: CopyFiles@2
+              displayName: Copy Docker Compose File
+              inputs:
+                SourceFolder: $(Pipeline.Workspace)/$(artifactName)/filer/
+                OverWrite: true
+                Contents: docker-compose.yml
+                TargetFolder: /home/filer/docker/
+
+            - task: Bash@3
+              displayName: Docker Compose Up
+              inputs:
+                targetType: 'inline'
+                script: |
+                  # CD to dock folder and run docker up
+                  cd /home/filer/docker/
+                  docker-compose pull
+                  docker-compose up -d --remove-orphans
+                  docker image prune -f
+                  docker container restart pihole
+
+            - task: CmdLine@2
+              displayName: Notify Pushover
+              inputs:
+                script: |
+                  curl -s \
+                    --form-string "token=$(pushoverToken)" \
+                    --form-string "user=$(pushoverKey)" \
+                    --form-string "message=FILER Stage Complete" \
+                    --form-string "priority=-1" \
+                    https://api.pushover.net/1/messages.json
+
+            - task: DeleteFiles@1
+              inputs:
+                SourceFolder: '$(Pipeline.Workspace)'
+                Contents: '**/*'
+
+#########################################################################################################################
+#########################################################################################################################
+###################################################### FATTY ###########################################################
+# TO RELEASE PARAM releasePlex MUST BE SET TO true!!
+  - stage: deployDockerLiveEnvironment_fatty
+    displayName: FATTY Deploy (CD)
+    dependsOn: 
+      - deployDockerLiveEnvironment_filer
+    condition: and(succeeded(), eq('${{ parameters.releasePlex }}', 'true'))
+    jobs:
+    - deployment: deployDockerResourcesFatty
+      displayName: Deploy Docker Resources to FATTY Host
+
+      # creates an environment if it doesn't exist
+      environment:
+        name: Docker
+        resourceName: fatty
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+           
+            - task: Bash@3
+              displayName: Docker Network Create 
+              inputs:
+                targetType: 'inline'
+                script: 'docker network create -d bridge $(dockerNetwork) || true'
+
+            - task: CopyFiles@2
+              displayName: Copy Docker Compose File
+              inputs:
+                SourceFolder: $(Pipeline.Workspace)/$(artifactName)/fatty/
+                OverWrite: true
+                Contents: docker-compose.yml
+                TargetFolder: /home/fatty/docker/
+
+            - task: Bash@3
+              displayName: Docker Compose Up
+              inputs:
+                targetType: 'inline'
+                script: |
+                  # CD to dock folder and run docker up
+                  cd /home/fatty/docker/
+                  docker-compose pull
+                  docker-compose up -d --remove-orphans
+                  docker image prune -f
+
+            - task: CmdLine@2
+              displayName: Notify Pushover
+              inputs:
+                script: |
+                  curl -s \
+                    --form-string "token=$(pushoverToken)" \
+                    --form-string "user=$(pushoverKey)" \
+                    --form-string "message=FATTY Stage Complete (Plex: True)" \
+                    --form-string "priority=-1" \
+                    https://api.pushover.net/1/messages.json
+
+            - task: DeleteFiles@1
+              inputs:
+                SourceFolder: '$(Pipeline.Workspace)'
+                Contents: '**/*'   
